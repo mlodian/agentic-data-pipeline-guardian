@@ -114,7 +114,7 @@ def reason_node(state: GuardianState) -> GuardianState:
         captured["issue_body"] = body
         return "Issue queued for creation."
 
-    model_name = os.environ.get("GUARDIAN_MODEL", "claude-3-5-sonnet-latest")
+    model_name = os.environ.get("GUARDIAN_MODEL", "claude-sonnet-4-5-20250929")
     model = ChatAnthropic(model=model_name, temperature=0)
     model_with_tools = model.bind_tools([draft_incident_report, open_github_issue])
 
