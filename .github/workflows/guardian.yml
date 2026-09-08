@@ -1,0 +1,62 @@
+# Scheduled production-style run: ingest a new batch, transform it, then let
+# the Guardian agent check it and (if ANTHROPIC_API_KEY is configured as a
+# repo secret) reason about any findings with Claude and open a GitHub issue
+# for anything CRITICAL. Without that secret it still runs end to end using
+# the deterministic fallback in agent/guardian_agent.py -- this workflow
+# never hard-fails just because the key isn't set yet.
+#
+# The hourly cron here is illustrative -- match it to your actual upstream
+# ingestion cadence, and remember every run that has ANTHROPIC_API_KEY set
+# costs a small amount of API usage.
+name: Guardian scheduled run
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  guardian:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ingest latest batch
+        run: python -m ingestion.generate --seed ${{ github.run_number }}
+
+      - name: dbt build (deps, run, test)
+        working-directory: dbt_project
+        env:
+          DBT_PROFILES_DIR: .
+          GUARDIAN_DB_PATH: ../data/guardian.duckdb
+        run: |
+          dbt deps
+          dbt build
+
+      - name: Run the Guardian agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GUARDIAN_DB_PATH: data/guardian.duckdb
+          GUARDIAN_OPEN_GH_ISSUES: "true"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m agent.guardian_agent
+
+      - name: Upload incident report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardian-report-${{ github.run_number }}
+          path: docs/incident_reports/*.md
+          if-no-files-found: ignore

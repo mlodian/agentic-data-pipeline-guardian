@@ -1,0 +1,41 @@
+{
+  "crm_customers": {
+    "account_owner": "VARCHAR",
+    "company_name": "VARCHAR",
+    "customer_id": "BIGINT",
+    "industry": "VARCHAR",
+    "ingested_at": "TIMESTAMP WITH TIME ZONE",
+    "is_active": "BOOLEAN",
+    "region": "VARCHAR",
+    "signup_date": "DATE"
+  },
+  "crm_deals": {
+    "amount": "DOUBLE",
+    "close_date": "DATE",
+    "currency": "VARCHAR",
+    "customer_id": "BIGINT",
+    "deal_id": "BIGINT",
+    "deal_stage": "VARCHAR",
+    "ingested_at": "TIMESTAMP WITH TIME ZONE",
+    "owner": "VARCHAR"
+  },
+  "erp_invoices": {
+    "amount": "DOUBLE",
+    "customer_id": "BIGINT",
+    "due_date": "DATE",
+    "ingested_at": "TIMESTAMP WITH TIME ZONE",
+    "invoice_date": "DATE",
+    "invoice_id": "BIGINT",
+    "status": "VARCHAR"
+  },
+  "hris_employees": {
+    "department": "VARCHAR",
+    "email": "VARCHAR",
+    "employee_id": "BIGINT",
+    "full_name": "VARCHAR",
+    "hire_date": "DATE",
+    "ingested_at": "TIMESTAMP WITH TIME ZONE",
+    "is_active": "BOOLEAN",
+    "manager_id": "DOUBLE"
+  }
+}

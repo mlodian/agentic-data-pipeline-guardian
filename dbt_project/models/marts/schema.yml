@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: One row per customer, the conformed dimension used across marts.
+    columns:
+      - name: customer_id
+        data_tests: [not_null, unique]
+
+  - name: fct_deals
+    description: One row per CRM deal, joined to its customer.
+    columns:
+      - name: deal_id
+        data_tests: [not_null, unique]
+      - name: customer_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: amount
+        data_tests: [not_null]
+
+  - name: fct_invoices
+    description: One row per ERP invoice, joined to its customer.
+    columns:
+      - name: invoice_id
+        data_tests: [not_null, unique]
+      - name: customer_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id

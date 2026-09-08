@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit + integration tests
+        run: pytest tests/ -v
+
+      - name: Seed a clean dataset
+        run: python -m ingestion.generate --seed 1
+
+      - name: dbt build (deps, run, test)
+        working-directory: dbt_project
+        env:
+          DBT_PROFILES_DIR: .
+          GUARDIAN_DB_PATH: ../data/guardian.duckdb
+        run: |
+          dbt deps
+          dbt build
+
+      - name: Run the Guardian agent (deterministic mode, no API key needed)
+        env:
+          GUARDIAN_DB_PATH: data/guardian.duckdb
+        run: python -m agent.guardian_agent --dry-run

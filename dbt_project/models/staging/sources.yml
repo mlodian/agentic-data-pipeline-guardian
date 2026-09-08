@@ -1,0 +1,34 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: >
+      Landing tables written directly by the ingestion connectors
+      (ingestion/generate.py in production this would be real CRM/ERP/HRIS
+      API connectors). Untouched, upstream-shaped data.
+    tables:
+      - name: crm_customers
+        description: One row per customer as sent by the CRM system.
+        columns:
+          - name: customer_id
+            data_tests: [not_null, unique]
+      - name: crm_deals
+        description: One row per sales opportunity/deal from the CRM system.
+        columns:
+          - name: deal_id
+            data_tests: [not_null, unique]
+          - name: customer_id
+            data_tests: [not_null]
+      - name: erp_invoices
+        description: One row per invoice from the ERP system.
+        columns:
+          - name: invoice_id
+            data_tests: [not_null, unique]
+          - name: customer_id
+            data_tests: [not_null]
+      - name: hris_employees
+        description: One row per employee from the HRIS system.
+        columns:
+          - name: employee_id
+            data_tests: [not_null, unique]

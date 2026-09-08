@@ -1,0 +1,10 @@
+# No secrets here on purpose: DuckDB is an embedded, file-based database, so
+# "connecting" to it just means pointing at a local file. GUARDIAN_DB_PATH
+# lets CI and local dev point at different files without editing this.
+guardian:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('GUARDIAN_DB_PATH', '../data/guardian.duckdb') }}"
+      threads: 4
