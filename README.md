@@ -107,19 +107,6 @@ copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`, then drop
 pytest tests/ -v   # 23 tests: unit tests on every check, integration tests on the graph
 ```
 
-## Mapping to the job description
-
-| JD requirement | Where |
-|---|---|
-| Build/deploy/maintain autonomous AI agent workflows (LangChain/LangGraph, Claude) | `agent/guardian_agent.py` — LangGraph `StateGraph` with conditional routing, Claude tool-calling |
-| Agentic data ingestion from CRM/ERP/HRIS to a cloud warehouse | `ingestion/generate.py` (connector-shaped, per-system) → `raw` schema |
-| Detect, isolate, and address schema changes and pipeline issues | `agent/checks.py::diff_schema` + the full deterministic check suite |
-| Terraform / Infrastructure-as-Code | `terraform/` — warehouse, database, RBAC, masking policies |
-| NL requests → dbt models, optimized SQL, automated BI | `dbt_project/` (this project's flagship for that bullet is project #2, the NL-to-Analytics agent) |
-| Automation for pipeline management, monitoring, governance | `.github/workflows/guardian.yml` scheduled run |
-| Intelligent data monitoring, RBAC governance, PII masking, lineage | `agent/checks.py::detect_pii_columns` + `terraform/rbac.tf` + `terraform/masking_policies.tf` |
-| Advanced Python/SQL | Throughout — see `agent/`, `ingestion/`, `dbt_project/models/` |
-
 ## Project structure
 
 ```
