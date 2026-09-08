@@ -1,4 +1,5 @@
 from agent.checks import (
+    check_row_count_zscore,
     check_freshness,
     check_not_null,
     check_referential_integrity,
@@ -143,3 +144,77 @@ def test_snapshot_schema_reflects_live_table(con):
     snapshot = snapshot_schema(con, schema="raw")
     assert snapshot["widgets"]["id"] == "BIGINT"
     assert snapshot["widgets"]["name"] == "VARCHAR"
+
+
+# ---------------------------------------------------------------------------
+# Statistical volume anomaly detection
+#
+# check_row_count_anomaly asks "did this move more than 50% from one
+# baseline". check_row_count_zscore asks the better question -- "is this
+# unusual for *this* table" -- which is what stops a naturally volatile feed
+# alerting every run while a rock-steady one drifts unnoticed.
+# ---------------------------------------------------------------------------
+
+def _table_of_size(con, n: int):
+    con.execute(f"create or replace table raw.vol as select * from range({n}) t(i)")
+
+
+def test_zscore_returns_nothing_without_enough_history(con):
+    """Two data points cannot produce a meaningful standard deviation, so the
+    check stays silent rather than inventing confidence it doesn't have."""
+    _table_of_size(con, 1000)
+    assert check_row_count_zscore(con, "raw.vol", [990, 1010]) is None
+
+
+def test_zscore_ignores_normal_variation(con):
+    """A count sitting inside its own historical spread is not news."""
+    _table_of_size(con, 1000)
+    assert check_row_count_zscore(con, "raw.vol", [990, 1010, 1005, 995]) is None
+
+
+def test_zscore_flags_a_count_far_outside_its_history(con):
+    _table_of_size(con, 1000)
+    finding = check_row_count_zscore(con, "raw.vol", [500, 510, 505, 495])
+    assert finding is not None
+    assert finding.check_name == "row_count_zscore"
+    assert finding.details["z_score"] > 3
+
+
+def test_zscore_flags_collapses_as_well_as_spikes(con):
+    """A silent ingestion failure shows up as a count far *below* the mean;
+    an absolute-value threshold is what catches both directions."""
+    _table_of_size(con, 10)
+    finding = check_row_count_zscore(con, "raw.vol", [1000, 1010, 990, 1005])
+    assert finding is not None
+    assert finding.details["z_score"] < 0
+    assert "below" in finding.message
+
+
+def test_zscore_severity_scales_with_how_extreme_the_deviation_is(con):
+    """Three sigma is worth a look; past six is worth waking someone.
+    History [900, 940, 920, 960] has mean 930 and sigma ~22, so 1019 rows is
+    ~4 sigma (warning) and 1200 rows is ~12 sigma (critical)."""
+    history = [900, 940, 920, 960]
+
+    _table_of_size(con, 1019)
+    mild = check_row_count_zscore(con, "raw.vol", history)
+    assert mild.severity is Severity.WARNING
+
+    _table_of_size(con, 1200)
+    extreme = check_row_count_zscore(con, "raw.vol", history)
+    assert extreme.severity is Severity.CRITICAL
+
+
+def test_zscore_handles_a_perfectly_stable_history(con):
+    """Zero variance would divide by zero. A table that has never moved is
+    effectively a contract, so any movement warns rather than crashing."""
+    _table_of_size(con, 1200)
+    finding = check_row_count_zscore(con, "raw.vol", [900, 900, 900])
+    assert finding is not None
+    assert finding.severity is Severity.WARNING
+    assert finding.details["z_score"] is None
+
+
+def test_zscore_stays_silent_when_a_stable_table_does_not_move(con):
+    _table_of_size(con, 900)
+    assert check_row_count_zscore(con, "raw.vol", [900, 900, 900]) is None

@@ -22,13 +22,32 @@ models:
         data_tests: [not_null]
 
   - name: fct_invoices
-    description: One row per ERP invoice, joined to its customer.
+    description: One row per ERP invoice, raised against a closed-won deal.
     columns:
       - name: invoice_id
         data_tests: [not_null, unique]
+      - name: deal_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('fct_deals')
+              field: deal_id
       - name: customer_id
         data_tests:
           - not_null
           - relationships:
               to: ref('dim_customers')
               field: customer_id
+
+  - name: customer_revenue_summary
+    description: >
+      One row per customer combining CRM pipeline and ERP billing. The
+      downstream model with the widest blast radius in this project -- it
+      depends on all three upstream marts.
+    columns:
+      - name: customer_id
+        data_tests: [not_null, unique]
+      - name: booked_revenue
+        data_tests: [not_null]
+      - name: invoiced_revenue
+        data_tests: [not_null]

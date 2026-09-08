@@ -22,13 +22,16 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 from faker import Faker
 
-from ingestion.db import connect
+from ingestion.db import connect, fetch_scalar
 
 REGIONS = ["APAC", "EMEA", "NA", "LATAM"]
 INDUSTRIES = ["Fintech", "Healthcare", "Retail", "Manufacturing", "SaaS", "Logistics"]
 DEAL_STAGES = ["prospecting", "qualified", "proposal", "negotiation", "closed_won", "closed_lost"]
 DEPARTMENTS = ["Engineering", "Sales", "Compliance", "Finance", "Operations", "HR"]
-INVOICE_STATUSES = ["paid", "unpaid", "overdue", "void"]
+# "void" is deliberately absent: invoices here are raised against closed-won
+# deals, so a void invoice means CRM and ERP disagree -- that is a finding,
+# not a normal state. inject_reconciliation_break() is what creates them.
+INVOICE_STATUSES = ["paid", "unpaid", "overdue"]
 
 
 def _now() -> datetime:
@@ -71,21 +74,47 @@ def generate_crm_deals(fake: Faker, n: int, customer_ids: list[int]) -> list[dic
     return rows
 
 
-def generate_erp_invoices(fake: Faker, n: int, customer_ids: list[int]) -> list[dict]:
+def generate_erp_invoices(fake: Faker, deals: list[dict], split_rate: float = 0.2) -> list[dict]:
+    """Invoices are derived from closed-won CRM deals, not generated
+    independently.
+
+    This matters more than it looks. If the ERP invented its own customers
+    and amounts, the two systems would never agree and cross-system
+    reconciliation would be meaningless -- it would flag every run. By
+    raising an invoice against each closed-won deal, clean data reconciles
+    to the cent, so a reconciliation finding means something actually broke.
+
+    About `split_rate` of deals are invoiced in two parts, because real
+    billing does that, and it proves the reconciliation compares summed
+    totals per customer rather than naively matching row for row.
+    """
     rows = []
-    for i in range(1, n + 1):
-        invoice_date = fake.date_between(start_date="-1y", end_date="today")
-        rows.append(
-            {
-                "invoice_id": i,
-                "customer_id": random.choice(customer_ids),
-                "invoice_date": invoice_date,
-                "due_date": invoice_date + timedelta(days=30),
-                "amount": round(random.uniform(500, 80_000), 2),
-                "status": random.choice(INVOICE_STATUSES),
-                "ingested_at": _now(),
-            }
-        )
+    invoice_id = 1
+    for deal in deals:
+        if deal["deal_stage"] != "closed_won" or deal["amount"] is None:
+            continue
+
+        if random.random() < split_rate:
+            first = round(deal["amount"] / 2, 2)
+            amounts = [first, round(deal["amount"] - first, 2)]
+        else:
+            amounts = [deal["amount"]]
+
+        for amount in amounts:
+            invoice_date = fake.date_between(start_date="-1y", end_date="today")
+            rows.append(
+                {
+                    "invoice_id": invoice_id,
+                    "deal_id": deal["deal_id"],
+                    "customer_id": deal["customer_id"],
+                    "invoice_date": invoice_date,
+                    "due_date": invoice_date + timedelta(days=30),
+                    "amount": amount,
+                    "status": random.choice(INVOICE_STATUSES),
+                    "ingested_at": _now(),
+                }
+            )
+            invoice_id += 1
     return rows
 
 
@@ -144,15 +173,43 @@ def inject_dq_issues(con) -> None:
     """)
 
 
+def inject_reconciliation_break(con) -> None:
+    """Simulate the CRM and the ERP drifting apart.
+
+    This is the failure class no single-table check can see: after this
+    runs, every row in both tables is still individually valid. Deals are
+    well-formed, invoices are well-formed, every key resolves. The systems
+    simply disagree about how much money there is -- which is exactly the
+    kind of problem that reaches a finance close before it reaches a
+    data engineer.
+    """
+    print("[inject] simulating CRM/ERP reconciliation drift")
+    # Invoices voided in the ERP while the deal stays closed-won in the CRM.
+    con.execute("""
+        UPDATE raw.erp_invoices SET status = 'void'
+        WHERE invoice_id IN (SELECT invoice_id FROM raw.erp_invoices USING SAMPLE 12 ROWS)
+    """)
+    # A partial load: some invoices never landed at all.
+    con.execute("""
+        DELETE FROM raw.erp_invoices
+        WHERE invoice_id IN (SELECT invoice_id FROM raw.erp_invoices USING SAMPLE 8 ROWS)
+    """)
+    # An amount edited in one system only.
+    con.execute("""
+        UPDATE raw.erp_invoices SET amount = round(amount * 0.85, 2)
+        WHERE invoice_id IN (SELECT invoice_id FROM raw.erp_invoices USING SAMPLE 10 ROWS)
+    """)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--n-customers", type=int, default=400)
     parser.add_argument("--n-deals", type=int, default=1200)
-    parser.add_argument("--n-invoices", type=int, default=900)
     parser.add_argument("--n-employees", type=int, default=150)
     parser.add_argument("--inject-schema-drift", action="store_true")
     parser.add_argument("--inject-dq-issues", action="store_true")
+    parser.add_argument("--inject-reconciliation-break", action="store_true")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -165,10 +222,13 @@ def main() -> None:
     con.execute("CREATE OR REPLACE TABLE raw.crm_customers AS SELECT * FROM customers")
 
     customer_ids = customers["customer_id"].tolist()
-    deals = pd.DataFrame(generate_crm_deals(fake, args.n_deals, customer_ids))
+    deal_rows = generate_crm_deals(fake, args.n_deals, customer_ids)
+    deals = pd.DataFrame(deal_rows)
     con.execute("CREATE OR REPLACE TABLE raw.crm_deals AS SELECT * FROM deals")
 
-    invoices = pd.DataFrame(generate_erp_invoices(fake, args.n_invoices, customer_ids))
+    # Invoices are raised against closed-won deals, so their count is derived
+    # rather than configured -- see generate_erp_invoices.
+    invoices = pd.DataFrame(generate_erp_invoices(fake, deal_rows))
     con.execute("CREATE OR REPLACE TABLE raw.erp_invoices AS SELECT * FROM invoices")
 
     employees = pd.DataFrame(generate_hris_employees(fake, args.n_employees))
@@ -178,10 +238,12 @@ def main() -> None:
         inject_schema_drift(con)
     if args.inject_dq_issues:
         inject_dq_issues(con)
+    if args.inject_reconciliation_break:
+        inject_reconciliation_break(con)
 
     print("Ingestion complete:")
     for table in ["crm_customers", "crm_deals", "erp_invoices", "hris_employees"]:
-        count = con.execute(f"SELECT COUNT(*) FROM raw.{table}").fetchone()[0]
+        count = fetch_scalar(con, f"SELECT COUNT(*) FROM raw.{table}")
         print(f"  raw.{table}: {count} rows")
 
     con.close()

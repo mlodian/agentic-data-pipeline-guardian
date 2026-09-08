@@ -4,6 +4,7 @@ with source as (
 
 select
     invoice_id,
+    deal_id,
     customer_id,
     invoice_date,
     due_date,

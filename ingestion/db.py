@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -25,3 +26,18 @@ def connect(read_only: bool = False) -> duckdb.DuckDBPyConnection:
     if not read_only:
         con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     return con
+
+
+def fetch_row(con: duckdb.DuckDBPyConnection, sql: str) -> tuple[Any, ...]:
+    """Run a single-row aggregate query and return that row. Raises if the
+    query returns no row at all -- for the plain `count(*)`-style aggregates
+    this project runs, that would indicate a driver-level bug, not a valid
+    empty-table result (an empty table still yields one row with count 0)."""
+    row = con.execute(sql).fetchone()
+    if row is None:
+        raise RuntimeError(f"query returned no row: {sql}")
+    return row
+
+
+def fetch_scalar(con: duckdb.DuckDBPyConnection, sql: str) -> Any:
+    return fetch_row(con, sql)[0]

@@ -21,10 +21,15 @@ sources:
           - name: customer_id
             data_tests: [not_null]
       - name: erp_invoices
-        description: One row per invoice from the ERP system.
+        description: >
+          One row per invoice from the ERP system. Each invoice is raised
+          against a closed-won CRM deal, which is what makes CRM/ERP
+          reconciliation meaningful rather than decorative.
         columns:
           - name: invoice_id
             data_tests: [not_null, unique]
+          - name: deal_id
+            data_tests: [not_null]
           - name: customer_id
             data_tests: [not_null]
       - name: hris_employees

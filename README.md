@@ -1,79 +1,253 @@
 # Agentic Data Pipeline Guardian
 
-An autonomous agent that watches a data warehouse for schema drift and
-data-quality problems, triages what it finds with Claude, and escalates
-anything critical — extending a production AML data-quality framework
-(anomaly detection, risk-weighted test cases, health scoring) into a
-self-monitoring agentic workflow.
+An autonomous agent that watches a data warehouse for schema drift,
+data-quality problems, and cross-system disagreement — scores how bad things
+are, works out what breaks downstream, quarantines rows it can prove are
+invalid, and escalates anything that needs a human.
 
 ```
 CRM/ERP/HRIS  ──▶  raw tables  ──▶  dbt (staging → marts)
  connectors        (warehouse)                │
-                                               ▼
-                                    deterministic checks
-                                 (schema drift, nulls, dupes,
-                                  orphans, ranges, freshness,
-                                  PII column detection)
-                                               │
-                                               ▼
-                                   LangGraph agent (Claude)
-                                 triage → incident report
-                                 CRITICAL? ──▶ open GitHub issue
+                                              ▼
+                                   deterministic checks
+                            schema drift · nulls · dupes · orphans
+                            ranges · freshness · volume z-score
+                            PII columns · CRM↔ERP reconciliation
+                                              │
+                                              ▼
+                          risk-weighted health score (0–100)
+                          + trend vs. run history
+                                              │
+                                              ▼
+                          lineage: what breaks downstream
+                                              │
+                                              ▼
+                            LangGraph agent (Claude)
+                          triage → report → decide
+                              │            │
+                     quarantine bad rows   open GitHub issue
+                              │            │
+                              ▼            ▼
+                        incident report + run recorded to history
 ```
 
-## Why this project exists
+## Why I built this
 
-This is one of three portfolio projects built to demonstrate the skills a
-Senior Agentic Data Engineer role asks for that weren't yet visible in my
-work history: hands-on agent-building (LangChain/LangGraph, Claude
-tool-calling), Infrastructure-as-Code, and the modern
-ingestion-to-warehouse-to-BI stack (dbt, cloud warehouses). Rather than a
-generic tutorial project, this one is a direct extension of real production
-work: a 92%-accuracy ML anomaly detection pipeline built for AML
-transaction-monitoring data quality, and a rules-validation framework that
-took manual-sampling QA to 100% automated test coverage. The "risk-weighted
-test cases + health scoring" pattern from that work is the same pattern
-`agent/checks.py` and `agent/config.py` implement here, just pointed at a
-general-purpose warehouse instead of AML data.
+I spend my working life on data-quality assurance for AML compliance — test
+frameworks, risk-weighted scoring, anomaly detection over messy
+multi-source data. Two things about that work bother me enough that I
+wanted to build the answer properly rather than argue about it in design
+docs.
+
+The first is that most data-quality tooling stops at detection. It tells you
+forty things are wrong and leaves a human to work out which one matters,
+what it breaks, and what to do about it. The triage is the expensive part,
+and it's the part that gets skipped at 6pm on a Friday.
+
+The second is that "put an LLM on it" usually means putting the LLM in the
+worst possible place: making it responsible for *detecting* the problem, so
+now your monitoring is non-deterministic and you can't unit test it. That's
+backwards. Detection is arithmetic and should be boring, provable, and free.
+Judgment — what's urgent, what's related, what a human should do first — is
+where a model actually earns its place.
+
+So this is the version I'd want to run for real: every check deterministic
+and unit tested, a scoring model you can recompute by hand, lineage that
+tells you the blast radius, and exactly one node in the pipeline that calls
+a model. It runs against a synthetic warehouse rather than a real one, which
+makes it a dry run rather than a deployment — but everything in it is built
+to survive being pointed at production, and the parts that aren't yet proven
+against real infrastructure are called out as such below rather than glossed
+over.
 
 ## What it actually does
 
 1. **Ingest** (`ingestion/generate.py`) — simulates CRM, ERP, and HRIS
-   upstream connectors landing data into raw warehouse tables. (In
-   production these would be real Salesforce/NetSuite/Workday-style API
-   clients; the point of this repo is what happens *after* ingestion, so
-   these are intentionally simple synthetic generators — including flags
-   to inject a realistic schema change or data-quality problems on demand,
-   for demoing what the Guardian catches.)
-2. **Transform** (`dbt_project/`) — dbt staging and mart models on top of
-   the raw tables, with 21 built-in dbt tests (not_null, unique,
-   relationships) as a first line of defense.
-3. **Check** (`agent/checks.py`, config-driven by `agent/config.py`) —
-   deterministic, unit-tested Python: schema-snapshot diffing against a
-   committed baseline, null-rate / uniqueness / referential-integrity /
-   value-range / freshness / row-count-anomaly checks, and PII-column
-   detection. Zero LLM calls in this layer on purpose — it has to be
-   trustworthy on its own.
-4. **Reason** (`agent/guardian_agent.py`) — a LangGraph state machine.
-   One node calls Claude (via tool-calling, `langchain-anthropic`) to
-   synthesize the findings into a prioritized, human-readable incident
-   report and decide whether to escalate. Runs fully without an API key
-   too (`--dry-run`, or just no `ANTHROPIC_API_KEY` set) via a
-   deterministic fallback, so the whole pipeline is always runnable and
-   testable in CI regardless of billing status.
-5. **Escalate** — for CRITICAL findings, opens a GitHub issue via the `gh`
-   CLI (gated behind `GUARDIAN_OPEN_GH_ISSUES=true` so local runs never
-   spam a real tracker).
-6. **Govern** (`terraform/`) — the production Snowflake target: warehouse,
-   database/schema layout matching the dbt structure, least-privilege RBAC
-   roles, and dynamic data-masking policies for the exact columns the PII
-   check flags. Not applied by this repo's CI (no cloud account behind
-   this sandbox) — see `terraform/README.md` for why and how to apply it
-   for real.
+   connectors landing data into raw tables. In production these would be
+   real Salesforce/NetSuite/Workday-style API clients; the interesting part
+   of this system is what happens *after* ingestion, so these are simple
+   synthetic generators with flags to inject a schema change, data-quality
+   problems, or a cross-system reconciliation break on demand.
 
-See `docs/examples/sample-report-critical-schema-drift.md` for a real
-report the agent produced against injected schema drift + data-quality
-issues.
+   ERP invoices are generated *from* closed-won CRM deals rather than
+   independently. That detail matters: if the two systems invented their own
+   numbers they'd never agree, and reconciliation would flag every run and
+   get switched off. Because clean data reconciles to the cent, a
+   reconciliation finding means something actually broke.
+
+2. **Transform** (`dbt_project/`) — staging and mart models over the raw
+   tables, with 21 dbt data tests (not_null, unique, relationships) as the
+   first line of defense. `customer_revenue_summary` joins all three mart
+   models, which is what gives upstream failures a real blast radius.
+
+3. **Check** (`agent/checks.py`, `agent/reconciliation.py`, config-driven by
+   `agent/config.py`) — deterministic, unit-tested Python in three tiers:
+
+   - *Structural*: schema-snapshot diffing against a committed baseline, PII
+     column detection.
+   - *Row-level*: nulls, uniqueness, referential integrity, value ranges,
+     freshness, row-count anomaly, and a z-score volume check that compares
+     a table against its own history instead of a fixed percentage.
+   - *Cross-system*: reconciliation between the CRM and the ERP — the only
+     tier that can fail while every table individually passes.
+
+   Zero LLM calls anywhere in this layer, on purpose.
+
+4. **Score** (`agent/scoring.py`) — turns findings into a risk-weighted
+   0–100 health score. Risk is `check weight × severity × table
+   criticality`, all declared in config, so any number in a report can be
+   recomputed by hand from the findings that produced it.
+
+5. **Remember** (`agent/history.py`) — every run is persisted to the
+   warehouse: score, findings, and row counts. That's what makes the next
+   run able to say "health dropped 67 points since yesterday" and what feeds
+   the z-score check its distribution.
+
+6. **Correlate** (`agent/lineage.py`) — maps each finding onto the dbt models
+   downstream of it. Five findings across three raw tables that all land on
+   the same mart are one incident, not five, and the report says so.
+
+7. **Reason** (`agent/guardian_agent.py`) — a LangGraph state machine.
+   Exactly one node calls Claude, via tool-calling, to synthesize everything
+   above into a prioritized incident report and make two bounded decisions:
+   escalate, and quarantine. Runs fully without an API key — the
+   deterministic fallback is what CI exercises on every push.
+
+8. **Act** (`agent/remediation.py`) — quarantines rows it can prove are
+   invalid (a negative invoice amount, a null required key) into a
+   `quarantine` schema with the run id and reason attached, so every removed
+   row is recoverable with a single SELECT. Nothing moves unless
+   `GUARDIAN_ENABLE_QUARANTINE=true`; the default is a costed dry run.
+
+9. **Provision** (`terraform/`) — the Snowflake equivalent of the local
+   DuckDB setup: database, warehouse, roles and grants, and column-level
+   masking policies for the PII the checks flag.
+
+## Key technical decisions
+
+**Detection is deterministic; the LLM only does judgment.** Nothing in the
+check, scoring, lineage, or reconciliation layers calls a model. A
+monitoring system whose detection path depends on an API call has a single
+point of failure it didn't need, and one you can't unit test. With no API
+key at all, seven of the eight graph nodes behave identically and the eighth
+falls back to a deterministic report.
+
+**The health score is linear and inspectable, not clever.** It starts at 100
+and subtracts `weight × severity × criticality` per finding. A smarter
+saturating curve would model reality slightly better and would cost the one
+property that makes the number usable in a compliance context: anyone can
+recompute it by hand and see exactly which findings drove it.
+
+**The score measures state; the trend is a separate finding.** Health
+degradation is computed after scoring and appended as its own finding
+without re-scoring. Folding the trend back into the score would make the
+number depend on itself.
+
+**The agent is told what its action costs before it decides.** The
+quarantine plan is costed — rows counted, read-only — in `correlate_node`,
+before `reason_node` runs. So whichever path decides to quarantine, model or
+fallback, it does so knowing exactly how many rows would move, rather than
+authorising an action whose size is only discovered afterwards.
+
+**Every side effect is opt-in and reversible.** Quarantine copies rows
+before deleting them and is gated behind an env var. GitHub issue creation
+is gated behind another. The agent can be wrong without being expensive.
+
+**Lineage is declared, not inferred.** The graph in `config.LINEAGE_EDGES`
+is hand-written, which is only safe if something fails loudly when a model
+is renamed. `tests/test_lineage.py` asserts in both directions that every
+declared node exists as a real `.sql` file and every real model appears in
+the map.
+
+## Major challenges
+
+**The history schema collided with the database catalog.** The DuckDB file
+is `guardian.duckdb`, so DuckDB already had a catalog named `guardian` —
+which made every `guardian.run_history` reference ambiguous ("use a fully
+qualified path like guardian.guardian") and broke every run the moment
+history was introduced. Renaming the schema to `guardian_history` fixed it;
+`tests/test_history.py` pins the name so it can't come back.
+
+**The first quarantine reports lied.** The plan was rendered into the report
+before the rows were counted, so the report said "0 rows" while the run
+summary said 7. The fix wasn't just moving the count earlier — it was
+realising the agent should know the size of an action *before* authorising
+it, which is now where the costing step lives.
+
+**Reconciliation only means something if clean data reconciles.** The first
+version generated invoices independently of deals, so the two systems
+disagreed by construction and the check fired on every run. A check that
+always fires is worse than no check. Deriving invoices from closed-won deals
+made clean data reconcile exactly, which is what gives a reconciliation
+finding its meaning.
+
+**The sandboxed dev environment blocks the Anthropic API outright.**
+Confirmed as an infrastructure restriction rather than an application bug by
+making the identical call from an unrestricted environment. Live
+verification of the Claude reasoning path ran from there instead of being
+skipped.
+
+## Testing
+
+123 tests, all deterministic, none requiring an API key or network:
+
+| Suite | Tests | What it protects |
+|---|---|---|
+| `test_checks.py` | 27 | Every check family: that it fires when it should, stays quiet when it shouldn't, and scales severity sensibly |
+| `test_scoring.py` | 19 | The score is ordered, weighted, bounded, and hand-recomputable |
+| `test_guardian_agent.py` | 18 | Graph routing end to end: clean, dirty, remediable |
+| `test_lineage.py` | 16 | Blast-radius maths, and that the declared graph matches the real dbt models |
+| `test_remediation.py` | 16 | The safety properties: opt-in, declared rules only, copy before delete, recoverable |
+| `test_history.py` | 15 | Runs persist faithfully; degradation is judged against the previous run |
+| `test_reconciliation.py` | 12 | Clean books stay silent; each way two systems can disagree surfaces separately |
+
+Plus 21 dbt data tests over the models themselves.
+
+## What isn't proven yet
+
+Worth stating plainly rather than leaving to be discovered:
+
+- **The Terraform is written, not applied.** `terraform/` targets the
+  Snowflake provider and is real configuration, but it has not been run
+  against a live Snowflake account — the pipeline runs on DuckDB locally and
+  in CI.
+- **The connectors are synthetic.** No real Salesforce/NetSuite/Workday API
+  client exists here; the generators simulate their shape and their failure
+  modes.
+- **The Claude path is verified, not battle-tested.** It has been run live
+  against the real API, and the transcript is in `docs/examples/` — but "ran
+  correctly on a real run" is a smaller claim than "ran unattended for six
+  months".
+
+## Project structure
+
+```
+agentic-data-pipeline-guardian/
+├── ingestion/
+│   ├── db.py                  # DuckDB connection helper
+│   └── generate.py            # synthetic CRM/ERP/HRIS + fault injection
+├── dbt_project/
+│   └── models/
+│       ├── staging/           # 4 staging views
+│       └── marts/             # dim_customers, fct_deals, fct_invoices,
+│                              # customer_revenue_summary
+├── agent/
+│   ├── config.py              # check rules, risk weights, lineage, quarantine rules
+│   ├── models.py              # Finding, Severity
+│   ├── checks.py              # deterministic check library
+│   ├── reconciliation.py      # cross-system checks
+│   ├── scoring.py             # risk-weighted health score
+│   ├── history.py             # run persistence + trend detection
+│   ├── lineage.py             # downstream impact / blast radius
+│   ├── remediation.py         # quarantine (opt-in, reversible)
+│   ├── run_checks.py          # runs every check tier
+│   └── guardian_agent.py      # the 8-node LangGraph pipeline
+├── terraform/                 # Snowflake: db, warehouse, RBAC, masking policies
+├── tests/                     # 123 tests
+└── docs/
+    ├── examples/              # real, unedited live-agent transcript
+    └── incident_reports/      # reports the agent has written
+```
 
 ## Running it locally
 
@@ -94,8 +268,10 @@ python -m agent.run_checks
 # 4. Run the full agent (deterministic mode, no API key needed)
 python -m agent.guardian_agent --dry-run
 
-# 5. See it actually catch something: inject drift + DQ issues, then re-run
-python -m ingestion.generate --seed 2 --inject-schema-drift --inject-dq-issues
+# 5. See it actually catch something: inject drift, DQ issues and a
+#    CRM/ERP reconciliation break, then re-run
+python -m ingestion.generate --seed 2 \
+    --inject-schema-drift --inject-dq-issues --inject-reconciliation-break
 python -m agent.guardian_agent --dry-run
 ```
 
@@ -103,18 +279,13 @@ To use Claude for the reasoning step instead of the deterministic fallback,
 copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`, then drop
 `--dry-run`.
 
+Two side effects are opt-in:
+
 ```bash
-pytest tests/ -v   # 23 tests: unit tests on every check, integration tests on the graph
+GUARDIAN_ENABLE_QUARANTINE=true python -m agent.guardian_agent   # actually isolate bad rows
+GUARDIAN_OPEN_GH_ISSUES=true     python -m agent.guardian_agent   # actually open an issue
 ```
 
-## Project structure
-
-```
-ingestion/        synthetic CRM/ERP/HRIS connectors -> raw warehouse tables
-dbt_project/       staging + marts models, dbt tests
-agent/             deterministic checks, config, LangGraph agent
-tests/             pytest: unit tests on checks, integration tests on the graph
-terraform/         production Snowflake IaC: warehouse, RBAC, masking
-.github/workflows/ CI (tests + dbt) and the scheduled Guardian run
-docs/examples/     a real incident report the agent produced
+```bash
+pytest tests/ -v   # 123 tests
 ```

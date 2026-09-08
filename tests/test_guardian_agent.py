@@ -1,63 +1,175 @@
-"""Integration tests for the Guardian LangGraph pipeline. These exercise the
-whole graph (collect -> reason -> [escalate] -> write_report) end to end in
---dry-run mode against real seeded data, so they don't need an Anthropic API
-key or network access."""
+"""Integration tests for the Guardian LangGraph pipeline.
+
+These exercise the whole graph -- collect -> score -> correlate -> reason ->
+[remediate] -> [escalate] -> write_report -> persist -- end to end in
+--dry-run mode against real seeded data, so they need no API key and no
+network. What they're really protecting is the routing: which nodes run for
+clean data, for dirty data, and for data that can be remediated.
+"""
 import sys
 
 import ingestion.generate as generate
-from agent.guardian_agent import build_graph
+from agent.guardian_agent import (
+    build_graph,
+    route_after_reason,
+    route_after_remediate,
+)
 
 
-def _seed(monkeypatch, seed: int, drift: bool = False, dq_issues: bool = False):
+def _seed(monkeypatch, seed: int, drift: bool = False, dq_issues: bool = False,
+          reconciliation: bool = False):
     argv = ["generate", "--seed", str(seed), "--n-customers", "40",
-            "--n-deals", "80", "--n-invoices", "60", "--n-employees", "15"]
+            "--n-deals", "80", "--n-employees", "15"]
     if drift:
         argv.append("--inject-schema-drift")
     if dq_issues:
         argv.append("--inject-dq-issues")
+    if reconciliation:
+        argv.append("--inject-reconciliation-break")
     monkeypatch.setattr(sys, "argv", argv)
     generate.main()
 
 
-def test_clean_run_produces_no_critical_findings(tmp_path, monkeypatch):
+def _run(tmp_path, monkeypatch, **seed_kwargs):
     monkeypatch.setenv("GUARDIAN_DB_PATH", str(tmp_path / "guardian.duckdb"))
-    _seed(monkeypatch, seed=1)
+    monkeypatch.delenv("GUARDIAN_OPEN_GH_ISSUES", raising=False)
+    monkeypatch.delenv("GUARDIAN_ENABLE_QUARANTINE", raising=False)
+    _seed(monkeypatch, **seed_kwargs)
+    return build_graph().invoke({"dry_run": True})
 
-    app = build_graph()
-    final_state = app.invoke({"dry_run": True})
 
-    assert final_state["report_path"]
-    assert final_state["open_issue"] is False
-    assert final_state.get("github_issue_url") is None
-    critical = [f for f in final_state["findings"] if f["severity"] == "CRITICAL"]
-    assert critical == []
+# --- routing decisions in isolation ---------------------------------------
 
+def test_route_prefers_remediation_when_rows_can_be_isolated():
+    state = {"want_quarantine": True, "quarantine_plan": [{"table": "raw.x"}], "open_issue": True}
+    assert route_after_reason(state) == "remediate"
+
+
+def test_route_escalates_when_critical_but_nothing_to_quarantine():
+    assert route_after_reason({"open_issue": True, "quarantine_plan": []}) == "escalate"
+
+
+def test_route_goes_straight_to_the_report_when_all_is_well():
+    assert route_after_reason({"open_issue": False}) == "write_report"
+
+
+def test_quarantine_alone_does_not_suppress_escalation():
+    """Isolating bad rows fixes the symptom, not the upstream cause -- a
+    critical finding still has to reach a human afterwards."""
+    assert route_after_remediate({"open_issue": True}) == "escalate"
+
+
+def test_remediation_without_critical_findings_skips_paging_anyone():
+    assert route_after_remediate({"open_issue": False}) == "write_report"
+
+
+# --- clean data ------------------------------------------------------------
+
+def test_clean_run_produces_no_critical_findings(tmp_path, monkeypatch):
+    final = _run(tmp_path, monkeypatch, seed=1)
+    assert final["report_path"]
+    assert final["open_issue"] is False
+    assert final.get("github_issue_url") is None
+    assert [f for f in final["findings"] if f["severity"] == "CRITICAL"] == []
+
+
+def test_clean_run_scores_in_the_healthy_band(tmp_path, monkeypatch):
+    """PII governance warnings are expected even on pristine data, so
+    'healthy' has to tolerate them rather than demand a perfect 100."""
+    final = _run(tmp_path, monkeypatch, seed=1)
+    assert final["health"]["band"] == "HEALTHY"
+    assert final["health"]["score"] > 90
+
+
+def test_clean_run_reconciles_the_two_systems(tmp_path, monkeypatch):
+    """Invoices are generated from closed-won deals, so a clean run must
+    produce no reconciliation findings -- otherwise the check is noise."""
+    names = {f["check_name"] for f in _run(tmp_path, monkeypatch, seed=1)["findings"]}
+    assert "reconciliation_totals" not in names
+    assert "reconciliation_coverage" not in names
+
+
+# --- dirty data ------------------------------------------------------------
 
 def test_dirty_run_flags_critical_and_requests_escalation(tmp_path, monkeypatch):
-    monkeypatch.setenv("GUARDIAN_DB_PATH", str(tmp_path / "guardian.duckdb"))
-    # No committed baseline exists for this fresh temp DB, so schema-drift
-    # comparison is skipped -- but referential-integrity, uniqueness, and
-    # range checks all run off the live data regardless, and the injector
-    # guarantees at least a duplicate PK and an orphaned FK.
-    _seed(monkeypatch, seed=2, dq_issues=True)
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    assert [f for f in final["findings"] if f["severity"] == "CRITICAL"]
+    assert final["open_issue"] is True
 
-    app = build_graph()
-    final_state = app.invoke({"dry_run": True})
 
-    critical = [f for f in final_state["findings"] if f["severity"] == "CRITICAL"]
-    assert critical, "expected at least one CRITICAL finding from injected DQ issues"
-    assert final_state["open_issue"] is True
+def test_dirty_run_scores_materially_lower_than_a_clean_one(tmp_path, monkeypatch):
+    clean = _run(tmp_path / "a", monkeypatch, seed=1)["health"]["score"]
+    dirty = _run(tmp_path / "b", monkeypatch, seed=2, dq_issues=True)["health"]["score"]
+    assert dirty < clean
+
+
+def test_reconciliation_break_is_caught_even_though_each_table_is_valid(tmp_path, monkeypatch):
+    """The point of the cross-system tier: every row in both tables passes
+    its own checks, and the systems still disagree."""
+    final = _run(tmp_path, monkeypatch, seed=3, reconciliation=True)
+    names = {f["check_name"] for f in final["findings"]}
+    assert names & {"reconciliation_totals", "reconciliation_coverage"}
+
+
+def test_findings_are_annotated_with_downstream_impact(tmp_path, monkeypatch):
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    table_findings = [f for f in final["findings"] if f["table"] != "__run__"]
+    assert all("blast_radius" in f["details"] for f in table_findings)
+
+
+def test_impact_summary_names_the_models_at_risk(tmp_path, monkeypatch):
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    models = {m["model"] for m in final["impact"]["impacted_models"]}
+    assert "customer_revenue_summary" in models
+
+
+# --- remediation path ------------------------------------------------------
+
+def test_quarantine_is_planned_but_not_applied_without_opt_in(tmp_path, monkeypatch):
+    """The graph reaches remediate_node and still writes nothing, because
+    GUARDIAN_ENABLE_QUARANTINE is unset."""
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    result = final.get("quarantine_result")
+    assert result is not None
+    assert result["enabled"] is False
+    assert result["applied_count"] == 0
+
+
+def test_quarantine_plan_is_costed_before_the_decision_is_made(tmp_path, monkeypatch):
+    """Regression test: the plan used to be rendered with zero counts because
+    rows were counted after reasoning, so the report said '0 rows' while the
+    run summary said 7. Counts must exist by the time reason_node runs."""
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    assert any(a["matched_rows"] > 0 for a in final["quarantine_plan"])
+    assert "0 row(s) matching" not in final["report_markdown"]
 
 
 def test_escalate_node_skips_issue_creation_without_opt_in(tmp_path, monkeypatch):
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    assert final["open_issue"] is True
+    assert final["github_issue_url"] is None
+
+
+# --- persistence -----------------------------------------------------------
+
+def test_every_run_is_recorded_to_history(tmp_path, monkeypatch):
+    """Without this the next run has no trend and no z-score baseline."""
     monkeypatch.setenv("GUARDIAN_DB_PATH", str(tmp_path / "guardian.duckdb"))
-    monkeypatch.delenv("GUARDIAN_OPEN_GH_ISSUES", raising=False)
-    _seed(monkeypatch, seed=2, dq_issues=True)
-
+    _seed(monkeypatch, seed=1)
     app = build_graph()
-    final_state = app.invoke({"dry_run": True})
+    app.invoke({"dry_run": True})
+    app.invoke({"dry_run": True})
 
-    # Critical findings exist and open_issue was requested, but without the
-    # explicit opt-in env var no real `gh issue create` call should happen.
-    assert final_state["open_issue"] is True
-    assert final_state["github_issue_url"] is None
+    from agent.history import recent_runs
+    from ingestion.db import connect
+    con = connect()
+    runs = recent_runs(con)
+    con.close()
+    assert len(runs) == 2
+
+
+def test_report_leads_with_the_health_score(tmp_path, monkeypatch):
+    """The number a human reads first has to be in the report, not only in
+    the CLI output."""
+    final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
+    assert "Health score:" in final["report_markdown"]

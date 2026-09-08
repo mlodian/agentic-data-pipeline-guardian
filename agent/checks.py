@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 from pathlib import Path
 
 import duckdb
 
 from agent.models import Finding, Severity
+from ingestion.db import fetch_row, fetch_scalar
 
 # ---------------------------------------------------------------------------
 # Schema snapshot + drift detection
@@ -133,9 +135,9 @@ def diff_schema(baseline: dict, current: dict) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 def check_not_null(con: duckdb.DuckDBPyConnection, table: str, column: str) -> Finding | None:
-    total, nulls = con.execute(
-        f"select count(*), count(*) filter (where {column} is null) from {table}"
-    ).fetchone()
+    total, nulls = fetch_row(
+        con, f"select count(*), count(*) filter (where {column} is null) from {table}"
+    )
     if total == 0 or nulls == 0:
         return None
     rate = nulls / total
@@ -151,9 +153,9 @@ def check_not_null(con: duckdb.DuckDBPyConnection, table: str, column: str) -> F
 
 
 def check_unique(con: duckdb.DuckDBPyConnection, table: str, column: str) -> Finding | None:
-    total, distinct = con.execute(
-        f"select count(*), count(distinct {column}) from {table}"
-    ).fetchone()
+    total, distinct = fetch_row(
+        con, f"select count(*), count(distinct {column}) from {table}"
+    )
     if total == distinct:
         return None
     dupes = total - distinct
@@ -174,15 +176,16 @@ def check_referential_integrity(
     ref_table: str,
     ref_column: str,
 ) -> Finding | None:
-    orphans = con.execute(
+    orphans = fetch_scalar(
+        con,
         f"""
         select count(*) from {table} t
         where t.{column} is not null
           and not exists (
               select 1 from {ref_table} r where r.{ref_column} = t.{column}
           )
-        """
-    ).fetchone()[0]
+        """,
+    )
     if orphans == 0:
         return None
     return Finding(
@@ -214,9 +217,9 @@ def check_value_range(
         return None
 
     where = " or ".join(clauses)
-    violations = con.execute(
-        f"select count(*) from {table} where {column} is not null and ({where})"
-    ).fetchone()[0]
+    violations = fetch_scalar(
+        con, f"select count(*) from {table} where {column} is not null and ({where})"
+    )
     if violations == 0:
         return None
     return Finding(
@@ -235,12 +238,13 @@ def check_freshness(
     timestamp_column: str,
     max_age_hours: float,
 ) -> Finding | None:
-    age_hours = con.execute(
+    age_hours = fetch_scalar(
+        con,
         f"""
         select date_diff('hour', max({timestamp_column}), current_timestamp)
         from {table}
-        """
-    ).fetchone()[0]
+        """,
+    )
     if age_hours is None or age_hours <= max_age_hours:
         return None
     return Finding(
@@ -268,7 +272,7 @@ def check_row_count_anomaly(
     failures (count collapses) and runaway duplication (count explodes)."""
     if baseline_count == 0:
         return None
-    current = con.execute(f"select count(*) from {table}").fetchone()[0]
+    current = fetch_scalar(con, f"select count(*) from {table}")
     deviation = abs(current - baseline_count) / baseline_count
     if deviation <= tolerance_pct:
         return None
@@ -281,6 +285,82 @@ def check_row_count_anomaly(
             f"baseline of {baseline_count}."
         ),
         details={"current": current, "baseline": baseline_count, "deviation": deviation},
+    )
+
+
+def check_row_count_zscore(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    history: list[int],
+    z_threshold: float = 3.0,
+    min_history: int = 3,
+) -> Finding | None:
+    """Volume anomaly detection against a table's own history, rather than a
+    fixed percentage tolerance.
+
+    check_row_count_anomaly asks "did this move more than 50% from a single
+    baseline". That threshold is wrong for almost every table: a feed that
+    naturally swings 40% run to run cries wolf, and a rock-steady one can
+    drift 45% without a peep. This asks the better question -- "is today's
+    count unusual *for this table*" -- by comparing it to the mean and
+    spread of its own recorded history.
+
+    Returns None until there are at least `min_history` prior runs, because
+    a standard deviation computed from two points is not a signal.
+    """
+    if len(history) < min_history:
+        return None
+
+    current = fetch_scalar(con, f"select count(*) from {table}")
+    mean = statistics.fmean(history)
+    stdev = statistics.pstdev(history)
+
+    if stdev == 0:
+        # A table whose count has never moved is a contract of sorts. Any
+        # change at all is worth surfacing, but as a warning rather than a
+        # critical -- one prior period of stability is thin evidence.
+        if current == mean:
+            return None
+        return Finding(
+            check_name="row_count_zscore",
+            severity=Severity.WARNING,
+            table=table,
+            message=(
+                f"{table} has {current} rows after {len(history)} run(s) of a "
+                f"perfectly stable {int(mean)}. No historical variance to "
+                "compare against, so any movement is notable."
+            ),
+            details={
+                "current": current,
+                "mean": mean,
+                "stdev": 0.0,
+                "z_score": None,
+                "history_points": len(history),
+            },
+        )
+
+    z_score = (current - mean) / stdev
+    if abs(z_score) < z_threshold:
+        return None
+
+    severity = Severity.CRITICAL if abs(z_score) >= z_threshold * 2 else Severity.WARNING
+    direction = "above" if z_score > 0 else "below"
+    return Finding(
+        check_name="row_count_zscore",
+        severity=severity,
+        table=table,
+        message=(
+            f"{table} has {current} rows, {abs(z_score):.1f} standard deviations "
+            f"{direction} its historical mean of {mean:,.0f} "
+            f"(sigma {stdev:,.0f}, {len(history)} prior runs)."
+        ),
+        details={
+            "current": current,
+            "mean": round(mean, 2),
+            "stdev": round(stdev, 2),
+            "z_score": round(z_score, 2),
+            "history_points": len(history),
+        },
     )
 
 
@@ -299,9 +379,10 @@ PII_COLUMN_PATTERNS = {
 
 
 def detect_pii_columns(schema: dict) -> list[Finding]:
-    """Flag columns whose *name* suggests they hold PII. This is a
-    governance signal (ties to the JD's RBAC/PII-masking bullet), not a
-    guarantee -- a real implementation would also sample values."""
+    """Flag columns whose *name* suggests they hold PII, so they can be
+    checked against the masking policies defined in terraform/. This is a
+    governance signal, not a guarantee -- a real implementation would also
+    sample values, since a column called 'notes' can hold PII too."""
     findings = []
     for table, columns in schema.items():
         for column in columns:

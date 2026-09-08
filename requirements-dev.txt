@@ -1,0 +1,4 @@
+# Dev-only tooling on top of the runtime requirements.
+-r requirements.txt
+
+mypy==1.10.0

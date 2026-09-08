@@ -1,5 +1,6 @@
 select
     i.invoice_id,
+    i.deal_id,
     i.customer_id,
     i.invoice_date,
     i.due_date,

@@ -1,6 +1,15 @@
-"""Single entry point that runs every deterministic check and returns a
-flat list of Findings. Used by both the CLI (`python -m agent.run_checks`)
-and the LangGraph agent as a tool.
+"""Single entry point that runs every deterministic check and returns a flat
+list of Findings. Used by both the CLI (`python -m agent.run_checks`) and
+the LangGraph agent's collect step.
+
+Three tiers of check run here, and the ordering matters:
+
+1. Structural  -- schema drift and PII, computed from an information_schema
+   snapshot before any row is queried.
+2. Row-level   -- uniqueness, not-null, referential integrity, ranges,
+   freshness, volume; one table at a time.
+3. Cross-system -- reconciliation between tables that should agree with each
+   other; the only tier that can fail while every table individually passes.
 """
 from __future__ import annotations
 
@@ -9,12 +18,18 @@ from pathlib import Path
 
 import duckdb
 
-from agent.config import ROW_COUNT_BASELINE_PATH, SCHEMA_BASELINE_PATH, TABLE_CHECKS
+from agent.config import (
+    RECONCILIATION_RULES,
+    ROW_COUNT_BASELINE_PATH,
+    SCHEMA_BASELINE_PATH,
+    TABLE_CHECKS,
+)
 from agent.checks import (
     check_freshness,
     check_not_null,
     check_referential_integrity,
     check_row_count_anomaly,
+    check_row_count_zscore,
     check_unique,
     check_value_range,
     detect_pii_columns,
@@ -24,6 +39,8 @@ from agent.checks import (
     snapshot_schema,
 )
 from agent.models import Finding
+from agent.reconciliation import run_reconciliations
+from ingestion.db import fetch_scalar
 
 
 def _load_row_count_baseline(path: str) -> dict:
@@ -32,13 +49,23 @@ def _load_row_count_baseline(path: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
+def current_row_counts(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """Row count of every monitored table. Recorded into run history so
+    later runs have a distribution to compute z-scores against."""
+    counts: dict[str, int] = {}
+    for table in TABLE_CHECKS:
+        try:
+            counts[table] = fetch_scalar(con, f"select count(*) from {table}")
+        except duckdb.Error:
+            # A table dropped upstream is already reported by schema diff;
+            # its absence shouldn't take down history recording too.
+            continue
+    return counts
+
+
 def _save_row_count_baseline(con: duckdb.DuckDBPyConnection, path: str) -> None:
-    counts = {
-        table: con.execute(f"select count(*) from {table}").fetchone()[0]
-        for table in TABLE_CHECKS
-    }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(counts, indent=2, sort_keys=True))
+    Path(path).write_text(json.dumps(current_row_counts(con), indent=2, sort_keys=True))
 
 
 def snapshot_baselines(con: duckdb.DuckDBPyConnection) -> None:
@@ -49,9 +76,17 @@ def snapshot_baselines(con: duckdb.DuckDBPyConnection) -> None:
     _save_row_count_baseline(con, ROW_COUNT_BASELINE_PATH)
 
 
-def run_all_checks(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+def run_all_checks(
+    con: duckdb.DuckDBPyConnection,
+    history_counts: dict[str, list[int]] | None = None,
+) -> list[Finding]:
+    """Run every check. `history_counts` maps a table to its previously
+    recorded row counts; when supplied, the statistical volume check runs
+    alongside the fixed-tolerance one."""
     findings: list[Finding] = []
+    history_counts = history_counts or {}
 
+    # --- Tier 1: structural -------------------------------------------------
     current_schema = snapshot_schema(con)
     baseline_schema = load_baseline(SCHEMA_BASELINE_PATH)
     if baseline_schema:
@@ -60,6 +95,7 @@ def run_all_checks(con: duckdb.DuckDBPyConnection) -> list[Finding]:
 
     row_count_baseline = _load_row_count_baseline(ROW_COUNT_BASELINE_PATH)
 
+    # --- Tier 2: row-level --------------------------------------------------
     for table, rules in TABLE_CHECKS.items():
         # Skip row-level checks entirely for a table that schema-diff already
         # flagged as dropped -- querying it would just raise a SQL error.
@@ -107,12 +143,23 @@ def run_all_checks(con: duckdb.DuckDBPyConnection) -> list[Finding]:
             if finding:
                 findings.append(finding)
 
+        table_history = history_counts.get(table, [])
+        if table_history:
+            finding = check_row_count_zscore(con, table, table_history)
+            if finding:
+                findings.append(finding)
+
+    # --- Tier 3: cross-system ----------------------------------------------
+    findings.extend(run_reconciliations(con, RECONCILIATION_RULES))
+
     return findings
 
 
 def main() -> None:
     import argparse
 
+    from agent.history import historical_row_counts
+    from agent.scoring import score_findings
     from ingestion.db import connect
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -131,17 +178,17 @@ def main() -> None:
         con.close()
         return
 
-    findings = run_all_checks(con)
+    history = {table: historical_row_counts(con, table) for table in TABLE_CHECKS}
+    findings = run_all_checks(con, history_counts=history)
+    health = score_findings([f.to_dict() for f in findings])
     con.close()
 
     if not findings:
-        print("No issues found. All checks passed.")
+        print("No issues found. All checks passed. Health score: 100.0 (HEALTHY)")
         return
 
-    by_severity = {"CRITICAL": 0, "WARNING": 0, "INFO": 0}
-    for f in findings:
-        by_severity[f.severity.value] += 1
-
+    by_severity = health.by_severity
+    print(f"Health score: {health.score} ({health.band})")
     print(f"{len(findings)} finding(s): "
           f"{by_severity['CRITICAL']} critical, "
           f"{by_severity['WARNING']} warning, "
