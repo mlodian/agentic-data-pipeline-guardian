@@ -19,6 +19,7 @@ import argparse
 import random
 from datetime import datetime, timedelta, timezone
 
+import duckdb
 import pandas as pd
 from faker import Faker
 
@@ -201,6 +202,19 @@ def inject_reconciliation_break(con) -> None:
     """)
 
 
+def inject_table_drop(con, table: str = "crm_customers") -> None:
+    """Simulate an upstream system removing a table entirely.
+
+    This is the worst schema event in the catalogue: not a renamed column, not
+    a type change, but a table that downstream models join to simply ceasing
+    to exist. crm_customers is the conformed dimension every mart depends on,
+    so dropping it is both the highest-weighted finding and the widest blast
+    radius the lineage graph can report.
+    """
+    print(f"[inject] simulating upstream removal of raw.{table}")
+    con.execute(f"DROP TABLE IF EXISTS raw.{table}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=1)
@@ -210,6 +224,18 @@ def main() -> None:
     parser.add_argument("--inject-schema-drift", action="store_true")
     parser.add_argument("--inject-dq-issues", action="store_true")
     parser.add_argument("--inject-reconciliation-break", action="store_true")
+    parser.add_argument("--inject-table-drop", action="store_true")
+    parser.add_argument(
+        "--scenario",
+        choices=["clean", "critical"],
+        default=None,
+        help=(
+            "Preset scenarios. 'critical' applies every injector at once -- a "
+            "dropped upstream table, schema drift, data-quality faults and a "
+            "CRM/ERP reconciliation break -- so the worst case is one command "
+            "and reproduces identically for a given seed."
+        ),
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -234,16 +260,30 @@ def main() -> None:
     employees = pd.DataFrame(generate_hris_employees(fake, args.n_employees))
     con.execute("CREATE OR REPLACE TABLE raw.hris_employees AS SELECT * FROM employees")
 
+    if args.scenario == "critical":
+        args.inject_schema_drift = True
+        args.inject_dq_issues = True
+        args.inject_reconciliation_break = True
+        args.inject_table_drop = True
+
     if args.inject_schema_drift:
         inject_schema_drift(con)
     if args.inject_dq_issues:
         inject_dq_issues(con)
     if args.inject_reconciliation_break:
         inject_reconciliation_break(con)
+    if args.inject_table_drop:
+        inject_table_drop(con)
 
     print("Ingestion complete:")
     for table in ["crm_customers", "crm_deals", "erp_invoices", "hris_employees"]:
-        count = fetch_scalar(con, f"SELECT COUNT(*) FROM raw.{table}")
+        # A table the drop-injector removed is gone on purpose -- report it as
+        # dropped rather than raising while summarising what was just built.
+        try:
+            count = fetch_scalar(con, f"SELECT COUNT(*) FROM raw.{table}")
+        except duckdb.Error:
+            print(f"  raw.{table}: DROPPED (simulated upstream removal)")
+            continue
         print(f"  raw.{table}: {count} rows")
 
     con.close()

@@ -38,7 +38,7 @@ from agent.checks import (
     save_baseline,
     snapshot_schema,
 )
-from agent.models import Finding
+from agent.models import Finding, Severity
 from agent.reconciliation import run_reconciliations
 from ingestion.db import fetch_scalar
 
@@ -117,6 +117,27 @@ def run_all_checks(
                 findings.append(finding)
 
         for fk in rules.get("foreign_keys", []):
+            # If the referenced table has itself been dropped upstream, the
+            # integrity query would raise and take down the whole run -- at
+            # exactly the moment the run matters most. Report the loss of
+            # verifiability as its own finding and carry on.
+            ref_name = fk["ref_table"].split(".", 1)[-1]
+            if ref_name not in current_schema:
+                findings.append(
+                    Finding(
+                        check_name="foreign_key_unverifiable",
+                        severity=Severity.CRITICAL,
+                        table=table,
+                        column=fk["column"],
+                        message=(
+                            f"Cannot verify '{fk['column']}' on {table}: reference "
+                            f"table {fk['ref_table']} no longer exists, so every "
+                            "row's key is now unvalidated."
+                        ),
+                        details={"ref_table": fk["ref_table"], "ref_column": fk["ref_column"]},
+                    )
+                )
+                continue
             finding = check_referential_integrity(
                 con, table, fk["column"], fk["ref_table"], fk["ref_column"]
             )

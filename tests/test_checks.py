@@ -218,3 +218,57 @@ def test_zscore_handles_a_perfectly_stable_history(con):
 def test_zscore_stays_silent_when_a_stable_table_does_not_move(con):
     _table_of_size(con, 900)
     assert check_row_count_zscore(con, "raw.vol", [900, 900, 900]) is None
+
+
+# ---------------------------------------------------------------------------
+# Resilience when the thing being checked has itself disappeared
+#
+# Regression tests for the failure that mattered most: an upstream table drop
+# used to raise a CatalogException out of the foreign-key check and take down
+# the entire run -- at exactly the moment the run was most needed.
+# ---------------------------------------------------------------------------
+
+def test_run_all_checks_survives_a_dropped_reference_table(con, tmp_path, monkeypatch):
+    """The monitor must not die when the worst thing it monitors for happens."""
+    from agent import run_checks as rc
+
+    con.execute("create table raw.crm_deals as select * from (values (1, 10, 5.0)) t(deal_id, customer_id, amount)")
+    monkeypatch.setattr(rc, "TABLE_CHECKS", {
+        "raw.crm_deals": {
+            "primary_key": "deal_id",
+            "foreign_keys": [
+                {"column": "customer_id", "ref_table": "raw.crm_customers", "ref_column": "customer_id"}
+            ],
+        }
+    })
+    monkeypatch.setattr(rc, "RECONCILIATION_RULES", [])
+    monkeypatch.setattr(rc, "SCHEMA_BASELINE_PATH", str(tmp_path / "schema.json"))
+    monkeypatch.setattr(rc, "ROW_COUNT_BASELINE_PATH", str(tmp_path / "counts.json"))
+
+    findings = rc.run_all_checks(con)  # must not raise
+
+    unverifiable = [f for f in findings if f.check_name == "foreign_key_unverifiable"]
+    assert unverifiable, "a missing FK target should be reported, not silently skipped"
+    assert unverifiable[0].severity is Severity.CRITICAL
+
+
+def test_missing_reference_table_is_reported_rather_than_skipped(con, tmp_path, monkeypatch):
+    """Losing the ability to verify a key is itself a finding: every row's key
+    is now unvalidated, and a silent skip would look identical to a clean run."""
+    from agent import run_checks as rc
+
+    con.execute("create table raw.crm_deals as select * from (values (1, 10, 5.0)) t(deal_id, customer_id, amount)")
+    monkeypatch.setattr(rc, "TABLE_CHECKS", {
+        "raw.crm_deals": {
+            "foreign_keys": [
+                {"column": "customer_id", "ref_table": "raw.crm_customers", "ref_column": "customer_id"}
+            ],
+        }
+    })
+    monkeypatch.setattr(rc, "RECONCILIATION_RULES", [])
+    monkeypatch.setattr(rc, "SCHEMA_BASELINE_PATH", str(tmp_path / "schema.json"))
+    monkeypatch.setattr(rc, "ROW_COUNT_BASELINE_PATH", str(tmp_path / "counts.json"))
+
+    finding = [f for f in rc.run_all_checks(con) if f.check_name == "foreign_key_unverifiable"][0]
+    assert finding.details["ref_table"] == "raw.crm_customers"
+    assert "no longer exists" in finding.message

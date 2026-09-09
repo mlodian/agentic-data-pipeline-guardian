@@ -181,6 +181,16 @@ always fires is worse than no check. Deriving invoices from closed-won deals
 made clean data reconcile exactly, which is what gives a reconciliation
 finding its meaning.
 
+**The monitor died at exactly the moment it mattered.** Simulating the worst
+case -- an upstream system dropping `crm_customers`, the dimension every mart
+joins to -- raised a `CatalogException` out of the foreign-key check and killed
+the entire run. The alarm died with the building. Two guards fixed it: a missing
+foreign-key target now becomes a CRITICAL `foreign_key_unverifiable` finding
+(losing the ability to verify a key is itself the finding, and a silent skip
+would look identical to a clean run), and a reconciliation whose source has
+vanished degrades to `reconciliation_unavailable` rather than raising. Both are
+regression-tested.
+
 **The sandboxed dev environment blocks the Anthropic API outright.**
 Confirmed as an infrastructure restriction rather than an application bug by
 making the identical call from an unrestricted environment. Live
@@ -189,17 +199,17 @@ skipped.
 
 ## Testing
 
-123 tests, all deterministic, none requiring an API key or network:
+126 tests, all deterministic, none requiring an API key or network:
 
 | Suite | Tests | What it protects |
 |---|---|---|
-| `test_checks.py` | 27 | Every check family: that it fires when it should, stays quiet when it shouldn't, and scales severity sensibly |
+| `test_checks.py` | 29 | Every check family: that it fires when it should, stays quiet when it shouldn't, and scales severity sensibly |
 | `test_scoring.py` | 19 | The score is ordered, weighted, bounded, and hand-recomputable |
 | `test_guardian_agent.py` | 18 | Graph routing end to end: clean, dirty, remediable |
 | `test_lineage.py` | 16 | Blast-radius maths, and that the declared graph matches the real dbt models |
 | `test_remediation.py` | 16 | The safety properties: opt-in, declared rules only, copy before delete, recoverable |
 | `test_history.py` | 15 | Runs persist faithfully; degradation is judged against the previous run |
-| `test_reconciliation.py` | 12 | Clean books stay silent; each way two systems can disagree surfaces separately |
+| `test_reconciliation.py` | 13 | Clean books stay silent; each way two systems can disagree surfaces separately |
 
 Plus 21 dbt data tests over the models themselves.
 
@@ -243,7 +253,7 @@ agentic-data-pipeline-guardian/
 │   ├── run_checks.py          # runs every check tier
 │   └── guardian_agent.py      # the 8-node LangGraph pipeline
 ├── terraform/                 # Snowflake: db, warehouse, RBAC, masking policies
-├── tests/                     # 123 tests
+├── tests/                     # 126 tests
 └── docs/
     ├── examples/              # real, unedited live-agent transcript
     └── incident_reports/      # reports the agent has written
@@ -273,6 +283,12 @@ python -m agent.guardian_agent --dry-run
 python -m ingestion.generate --seed 2 \
     --inject-schema-drift --inject-dq-issues --inject-reconciliation-break
 python -m agent.guardian_agent --dry-run
+
+# 6. Or go straight to the worst case in one command: every injector plus an
+#    upstream table drop. A real run of this against the Claude API is in
+#    docs/examples/live-run-critical-incident.md
+python -m ingestion.generate --seed 2 --scenario critical
+python -m agent.guardian_agent --dry-run
 ```
 
 To use Claude for the reasoning step instead of the deterministic fallback,
@@ -287,5 +303,5 @@ GUARDIAN_OPEN_GH_ISSUES=true     python -m agent.guardian_agent   # actually ope
 ```
 
 ```bash
-pytest tests/ -v   # 123 tests
+pytest tests/ -v   # 126 tests
 ```

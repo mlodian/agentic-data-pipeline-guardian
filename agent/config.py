@@ -69,6 +69,8 @@ CHECK_RISK_WEIGHTS: dict[str, float] = {
     # Integrity -- wrong numbers, not missing ones
     "uniqueness": 8.0,
     "referential_integrity": 7.0,
+    "foreign_key_unverifiable": 8.0,
+    "reconciliation_unavailable": 8.0,
     "reconciliation_totals": 7.0,
     "reconciliation_coverage": 6.0,
     "not_null": 6.0,

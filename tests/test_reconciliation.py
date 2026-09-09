@@ -137,3 +137,15 @@ def test_run_reconciliations_executes_every_configured_rule(books):
     assert run_reconciliations(books, []) == []
     books.execute("delete from raw.erp_invoices where customer_id = 1")
     assert run_reconciliations(books, RECONCILIATION_RULES)
+
+
+def test_a_vanished_source_degrades_to_a_finding_rather_than_raising(con):
+    """If one of the two systems is no longer queryable, reconciliation can't
+    run -- but losing the ability to reconcile is a CRITICAL finding, not a
+    crash that stops the report reaching a human."""
+    con.execute("create table raw.erp_invoices as select * from (values (1,'paid',100.0)) t(customer_id,status,amount)")
+    # raw.crm_deals deliberately absent
+    findings = reconcile(con, RULE)
+    assert len(findings) == 1
+    assert findings[0].check_name == "reconciliation_unavailable"
+    assert findings[0].severity is Severity.CRITICAL

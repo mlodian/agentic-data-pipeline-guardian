@@ -58,7 +58,24 @@ def reconcile(con: duckdb.DuckDBPyConnection, rule: dict[str, Any]) -> list[Find
       partial load, a currency or rounding bug, an amount edited in one
       system only).
     """
-    rows = con.execute(_rule_sql(rule)).fetchall()
+    try:
+        rows = con.execute(_rule_sql(rule)).fetchall()
+    except duckdb.Error as exc:
+        # One of the two systems is no longer queryable (a dropped table
+        # upstream). Losing the ability to reconcile is itself the finding.
+        return [
+            Finding(
+                check_name="reconciliation_unavailable",
+                severity=Severity.CRITICAL,
+                table=rule["left_table"],
+                message=(
+                    f"{rule['name']}: reconciliation could not run because a "
+                    f"source is unavailable ({exc.__class__.__name__}). The two "
+                    "systems are now unverified against each other."
+                ),
+                details={"rule": rule["name"], "error": str(exc)[:200]},
+            )
+        ]
     tolerance = float(rule.get("tolerance_pct", 0.01))
     name = rule["name"]
 
