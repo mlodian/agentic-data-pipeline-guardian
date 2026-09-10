@@ -1,18 +1,18 @@
-# Scheduled production-style run: ingest a new batch, transform it, then let
-# the Guardian agent check it and (if ANTHROPIC_API_KEY is configured as a
-# repo secret) reason about any findings with Claude and open a GitHub issue
-# for anything CRITICAL. Without that secret it still runs end to end using
-# the deterministic fallback in agent/guardian_agent.py -- this workflow
-# never hard-fails just because the key isn't set yet.
+# Production-style run: ingest a new batch, transform it, then let the
+# Guardian agent check it and (if ANTHROPIC_API_KEY is configured as a repo
+# secret) reason about any findings with Claude and open a GitHub issue for
+# anything CRITICAL. Without that secret it still runs end to end using the
+# deterministic fallback in agent/guardian_agent.py -- this workflow never
+# hard-fails just because the key isn't set yet.
 #
-# The hourly cron here is illustrative -- match it to your actual upstream
-# ingestion cadence, and remember every run that has ANTHROPIC_API_KEY set
+# Triggered on demand (Actions tab -> Run workflow) rather than on a cron.
+# An hourly schedule is a one-line change (add `schedule: - cron: "0 * * *
+# *"` back under `on:`) if you want it running continuously against a real
+# upstream cadence -- just know every run that has ANTHROPIC_API_KEY set
 # costs a small amount of API usage.
 name: Guardian scheduled run
 
 on:
-  schedule:
-    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 permissions:
