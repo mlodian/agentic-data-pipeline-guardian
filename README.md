@@ -191,6 +191,14 @@ would look identical to a clean run), and a reconciliation whose source has
 vanished degrades to `reconciliation_unavailable` rather than raising. Both are
 regression-tested.
 
+**The scheduled workflow had the same flaw one level up.** It ran `dbt build`
+before the Guardian, and dbt's own tests fail on exactly the batches the
+Guardian exists to catch -- so a bad batch failed the job and the monitor
+step never ran. It also ran on a fresh runner every time, so run history was
+always empty and the trend and z-score checks never had anything to compare
+against. The Guardian now runs first, against the raw layer, and the
+warehouse file is carried between runs through the Actions cache.
+
 **The sandboxed dev environment blocks the Anthropic API outright.**
 Confirmed as an infrastructure restriction rather than an application bug by
 making the identical call from an unrestricted environment. Live
