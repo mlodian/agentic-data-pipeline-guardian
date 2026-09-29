@@ -17,6 +17,7 @@ import duckdb
 
 from agent.config import HEALTH_DEGRADATION_THRESHOLD
 from agent.models import Finding, Severity
+from agent.scoring import finding_risk
 
 # Not "guardian": the database file is guardian.duckdb, so DuckDB already
 # has a *catalog* by that name, and "guardian.run_history" then resolves
@@ -117,7 +118,7 @@ def record_run(
                 finding.get("table"),
                 finding.get("column"),
                 finding.get("message"),
-                float(finding.get("details", {}).get("risk", 0.0) or 0.0),
+                finding_risk(finding),
                 json.dumps(finding.get("details", {}), default=str),
             ],
         )

@@ -199,16 +199,16 @@ skipped.
 
 ## Testing
 
-126 tests, all deterministic, none requiring an API key or network:
+131 tests, all deterministic, none requiring an API key or network:
 
 | Suite | Tests | What it protects |
 |---|---|---|
-| `test_checks.py` | 29 | Every check family: that it fires when it should, stays quiet when it shouldn't, and scales severity sensibly |
+| `test_checks.py` | 31 | Every check family: that it fires when it should, stays quiet when it shouldn't, and scales severity sensibly |
 | `test_scoring.py` | 19 | The score is ordered, weighted, bounded, and hand-recomputable |
-| `test_guardian_agent.py` | 18 | Graph routing end to end: clean, dirty, remediable |
+| `test_guardian_agent.py` | 20 | Graph routing end to end: clean, dirty, remediable |
 | `test_lineage.py` | 16 | Blast-radius maths, and that the declared graph matches the real dbt models |
 | `test_remediation.py` | 16 | The safety properties: opt-in, declared rules only, copy before delete, recoverable |
-| `test_history.py` | 15 | Runs persist faithfully; degradation is judged against the previous run |
+| `test_history.py` | 16 | Runs persist faithfully; degradation is judged against the previous run |
 | `test_reconciliation.py` | 13 | Clean books stay silent; each way two systems can disagree surfaces separately |
 
 Plus 21 dbt data tests over the models themselves.
@@ -253,7 +253,7 @@ agentic-data-pipeline-guardian/
 │   ├── run_checks.py          # runs every check tier
 │   └── guardian_agent.py      # the 8-node LangGraph pipeline
 ├── terraform/                 # Snowflake: db, warehouse, RBAC, masking policies
-├── tests/                     # 126 tests
+├── tests/                     # 131 tests
 └── docs/
     ├── examples/              # real, unedited live-agent transcript
     └── incident_reports/      # reports the agent has written
@@ -303,5 +303,5 @@ GUARDIAN_OPEN_GH_ISSUES=true     python -m agent.guardian_agent   # actually ope
 ```
 
 ```bash
-pytest tests/ -v   # 126 tests
+pytest tests/ -v   # 131 tests
 ```

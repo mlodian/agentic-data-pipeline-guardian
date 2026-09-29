@@ -272,3 +272,53 @@ def test_missing_reference_table_is_reported_rather_than_skipped(con, tmp_path, 
     finding = [f for f in rc.run_all_checks(con) if f.check_name == "foreign_key_unverifiable"][0]
     assert finding.details["ref_table"] == "raw.crm_customers"
     assert "no longer exists" in finding.message
+
+
+def _only_deals_rules(rc, monkeypatch, tmp_path, rules):
+    monkeypatch.setattr(rc, "TABLE_CHECKS", {"raw.crm_deals": rules})
+    monkeypatch.setattr(rc, "RECONCILIATION_RULES", [])
+    monkeypatch.setattr(rc, "SCHEMA_BASELINE_PATH", str(tmp_path / "schema.json"))
+    monkeypatch.setattr(rc, "ROW_COUNT_BASELINE_PATH", str(tmp_path / "counts.json"))
+
+
+def test_run_all_checks_survives_dropped_rule_columns(con, tmp_path, monkeypatch):
+    """Regression test: dropping a column that a range, foreign-key or
+    freshness rule names used to raise a BinderException out of collect and
+    kill the run. Schema diff reports the drop; the row-level checks for that
+    column must step aside rather than crash."""
+    from agent import run_checks as rc
+
+    con.execute("create table raw.crm_customers as select 1 as customer_id")
+    # crm_deals has lost customer_id, amount and ingested_at upstream.
+    con.execute("create table raw.crm_deals as select 1 as deal_id")
+    _only_deals_rules(rc, monkeypatch, tmp_path, {
+        "primary_key": "deal_id",
+        "foreign_keys": [
+            {"column": "customer_id", "ref_table": "raw.crm_customers", "ref_column": "customer_id"}
+        ],
+        "ranges": {"amount": {"min": 0}},
+        "freshness": {"column": "ingested_at", "max_age_hours": 48},
+    })
+
+    assert rc.run_all_checks(con) == []  # must not raise
+
+
+def test_dropped_reference_column_is_reported_as_unverifiable(con, tmp_path, monkeypatch):
+    """The referenced table still exists but its key column is gone: the
+    same loss of verifiability as a dropped table, and it must surface the
+    same way instead of raising."""
+    from agent import run_checks as rc
+
+    con.execute("create table raw.crm_customers as select 1 as client_id")
+    con.execute("create table raw.crm_deals as select 1 as deal_id, 1 as customer_id")
+    _only_deals_rules(rc, monkeypatch, tmp_path, {
+        "foreign_keys": [
+            {"column": "customer_id", "ref_table": "raw.crm_customers", "ref_column": "customer_id"}
+        ],
+    })
+
+    findings = rc.run_all_checks(con)
+    unverifiable = [f for f in findings if f.check_name == "foreign_key_unverifiable"]
+    assert len(unverifiable) == 1
+    assert unverifiable[0].severity is Severity.CRITICAL
+    assert "column raw.crm_customers.customer_id" in unverifiable[0].message

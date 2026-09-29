@@ -173,3 +173,63 @@ def test_report_leads_with_the_health_score(tmp_path, monkeypatch):
     the CLI output."""
     final = _run(tmp_path, monkeypatch, seed=2, dq_issues=True)
     assert "Health score:" in final["report_markdown"]
+
+
+# --- trend -----------------------------------------------------------------
+
+def test_trend_describes_this_run_not_the_previous_one(tmp_path, monkeypatch):
+    """Regression test: the trend was summarised from past runs only, so
+    after three clean runs a collapsed fourth reported '0.0 points above the
+    mean'. The delta must be this run's score against the runs before it."""
+    monkeypatch.setenv("GUARDIAN_DB_PATH", str(tmp_path / "guardian.duckdb"))
+    app = build_graph()
+    for _ in range(3):
+        _seed(monkeypatch, seed=1)
+        app.invoke({"dry_run": True})
+    _seed(monkeypatch, seed=1, dq_issues=True)
+    final = app.invoke({"dry_run": True})
+
+    trend = final["trend"]
+    assert trend["runs"] == 4
+    assert trend["current_score"] == final["health"]["score"]
+    assert trend["delta_vs_mean"] < 0
+    assert "below the mean of the previous 3 run(s)" in final["report_markdown"]
+
+
+# --- escalation floor ------------------------------------------------------
+
+class _ReportOnlyModel:
+    """Stands in for ChatAnthropic: drafts a report and never escalates."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        class _Response:
+            tool_calls = [{
+                "name": "draft_incident_report",
+                "args": {"title": "t", "markdown_report": "# model report"},
+            }]
+        return _Response()
+
+
+def test_critical_findings_escalate_even_if_the_model_does_not(monkeypatch):
+    """Whether something is CRITICAL is decided by the deterministic checks.
+    The model can add escalations, but forgetting to call open_github_issue
+    must not stop a critical finding from reaching a human."""
+    import langchain_anthropic
+
+    from agent.guardian_agent import reason_node
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(langchain_anthropic, "ChatAnthropic", _ReportOnlyModel)
+
+    critical = reason_node({"findings": [], "has_critical": True})
+    assert critical["report_markdown"] == "# model report"
+    assert critical["open_issue"] is True
+
+    quiet = reason_node({"findings": [], "has_critical": False})
+    assert quiet["open_issue"] is False
