@@ -38,6 +38,7 @@ from langgraph.graph import END, StateGraph
 
 from agent.config import TABLE_CHECKS
 from agent.history import (
+    RunRecord,
     check_health_degradation,
     historical_row_counts,
     new_run_id,
@@ -198,8 +199,18 @@ def score_node(state: GuardianState) -> GuardianState:
     if degradation:
         findings = findings + [degradation.to_dict()]
 
-    trend = summarize_trend(previous)
-    trend["current_score"] = health.score
+    # summarize_trend expects newest-first *including* the run being judged.
+    # `previous` holds only past runs, so passing it alone made the report
+    # describe the last run's trend as this one's.
+    current = RunRecord(
+        run_id=state.get("run_id", ""),
+        run_at=datetime.now(timezone.utc),
+        health_score=health.score,
+        band=health.band,
+        total_findings=len(findings),
+        critical_count=health.by_severity.get("CRITICAL", 0),
+    )
+    trend = summarize_trend([current, *previous])
 
     return {
         **state,
@@ -368,10 +379,14 @@ def reason_node(state: GuardianState) -> GuardianState:
         print("[guardian] model did not call draft_incident_report; using deterministic report.")
         captured["report_markdown"] = _render_report(state)
 
+    # The model may escalate more than the rules require, never less: a
+    # CRITICAL finding pages a human even if the model forgot to call
+    # open_github_issue. Whether something is critical was decided by the
+    # deterministic checks, not by the model.
     return {
         **state,
         "report_markdown": captured["report_markdown"],
-        "open_issue": captured.get("open_issue", False),
+        "open_issue": captured.get("open_issue", False) or state.get("has_critical", False),
         "want_quarantine": captured.get("want_quarantine", False),
         "issue_title": captured.get("issue_title", "Guardian: data-quality findings"),
         "issue_body": captured.get("issue_body", captured["report_markdown"]),

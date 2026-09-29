@@ -42,7 +42,7 @@ def health(score, critical=0, warning=0, info=0):
 def a_finding(check="not_null", severity="WARNING"):
     return {
         "check_name": check, "severity": severity, "table": "raw.crm_deals",
-        "column": "amount", "message": "m", "details": {"risk": 2.4},
+        "column": "amount", "message": "m", "details": {},
     }
 
 
@@ -164,3 +164,16 @@ def test_trend_summary_compares_current_against_prior_mean():
     assert summary["delta_vs_mean"] == pytest.approx(-25.0)
     assert summary["best_score"] == 100.0
     assert summary["worst_score"] == 70.0
+
+
+def test_record_run_persists_each_findings_scored_risk(hcon):
+    """Regression test: the risk column used to read details['risk'], which
+    nothing sets, so every stored finding had risk 0. It must hold the same
+    number the health score subtracted for that finding."""
+    from agent.scoring import finding_risk
+
+    finding = a_finding("uniqueness", "CRITICAL")
+    record_run(hcon, "r1", health(90.0, critical=1), [finding])
+    stored = hcon.execute("select risk from guardian_history.run_findings").fetchone()[0]
+    assert stored == pytest.approx(finding_risk(finding))
+    assert stored > 0

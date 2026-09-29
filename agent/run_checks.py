@@ -103,26 +103,38 @@ def run_all_checks(
         if table_name not in current_schema:
             continue
 
+        # Every column a rule names can disappear upstream, not just the
+        # table. Querying a missing column raises a BinderException and takes
+        # down the whole run, so each check below is skipped for columns
+        # schema diff has already reported as dropped.
+        columns = current_schema[table_name]
+
         pk = rules.get("primary_key")
-        if pk and pk in current_schema[table_name]:
+        if pk and pk in columns:
             finding = check_unique(con, table, pk)
             if finding:
                 findings.append(finding)
 
         for column in rules.get("not_null", []):
-            if column not in current_schema[table_name]:
+            if column not in columns:
                 continue  # already reported by schema diff
             finding = check_not_null(con, table, column)
             if finding:
                 findings.append(finding)
 
         for fk in rules.get("foreign_keys", []):
-            # If the referenced table has itself been dropped upstream, the
-            # integrity query would raise and take down the whole run -- at
-            # exactly the moment the run matters most. Report the loss of
-            # verifiability as its own finding and carry on.
+            if fk["column"] not in columns:
+                continue  # already reported by schema diff
+            # If the referenced table (or its key column) has itself been
+            # dropped upstream, the integrity query would raise and take down
+            # the whole run -- at exactly the moment the run matters most.
+            # Report the loss of verifiability as its own finding and carry on.
             ref_name = fk["ref_table"].split(".", 1)[-1]
-            if ref_name not in current_schema:
+            if ref_name not in current_schema or fk["ref_column"] not in current_schema[ref_name]:
+                missing = (
+                    f"table {fk['ref_table']}" if ref_name not in current_schema
+                    else f"column {fk['ref_table']}.{fk['ref_column']}"
+                )
                 findings.append(
                     Finding(
                         check_name="foreign_key_unverifiable",
@@ -131,7 +143,7 @@ def run_all_checks(
                         column=fk["column"],
                         message=(
                             f"Cannot verify '{fk['column']}' on {table}: reference "
-                            f"table {fk['ref_table']} no longer exists, so every "
+                            f"{missing} no longer exists, so every "
                             "row's key is now unvalidated."
                         ),
                         details={"ref_table": fk["ref_table"], "ref_column": fk["ref_column"]},
@@ -145,6 +157,8 @@ def run_all_checks(
                 findings.append(finding)
 
         for column, bounds in rules.get("ranges", {}).items():
+            if column not in columns:
+                continue  # already reported by schema diff
             finding = check_value_range(
                 con, table, column, bounds.get("min"), bounds.get("max")
             )
@@ -152,7 +166,7 @@ def run_all_checks(
                 findings.append(finding)
 
         freshness = rules.get("freshness")
-        if freshness:
+        if freshness and freshness["column"] in columns:
             finding = check_freshness(
                 con, table, freshness["column"], freshness["max_age_hours"]
             )
